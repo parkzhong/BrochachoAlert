@@ -34,7 +34,7 @@ LEADERBOARD_URL = os.getenv(
 )
 TARGET_NAMES = [
     name.strip()
-    for name in os.getenv("TARGET_NAMES", "Brocacho caption,Brochacos,Brocacho").split(",")
+    for name in os.getenv("TARGET_NAMES", "Brocacho AI Agent,Brocacho caption,Brochacos,Brocacho").split(",")
     if name.strip()
 ]
 CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
@@ -59,6 +59,8 @@ class LeaderboardSnapshot:
     tokens: int | None
     accuracy: float | None
     status: str | None
+    last_scored: str | None
+    last_submitted: str | None
     context: str
 
     @property
@@ -120,23 +122,77 @@ def clean_lines(html: str) -> list[str]:
     return [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
 
 
-def parse_snapshot(html: str) -> LeaderboardSnapshot:
-    lines = clean_lines(html)
-    lowered_aliases = [alias.casefold() for alias in TARGET_NAMES]
+def _all_element_text(element) -> str:
+    """Return visible text plus useful tooltip/accessibility attributes."""
+    parts = [element.get_text(" ", strip=True)]
+    for node in [element, *element.find_all(True)]:
+        for attr in ("title", "aria-label", "data-tooltip-content", "datetime"):
+            value = node.get(attr)
+            if value:
+                parts.append(str(value))
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
-    match_index = None
-    matched_line = None
-    for i, line in enumerate(lines):
-        folded = line.casefold()
-        if any(alias in folded for alias in lowered_aliases):
-            match_index = i
-            matched_line = line
+
+def _find_target_container(soup: BeautifulSoup):
+    aliases = sorted(TARGET_NAMES, key=len, reverse=True)
+    # Prefer exact/long aliases so a generic word such as "Brocacho" cannot
+    # accidentally match unrelated page content before the actual submission.
+    candidates = []
+    for text_node in soup.find_all(string=True):
+        text = re.sub(r"\s+", " ", str(text_node)).strip()
+        if not text:
+            continue
+        folded = text.casefold()
+        matched = next((a for a in aliases if a.casefold() in folded), None)
+        if matched:
+            candidates.append((len(matched), text_node))
+    if not candidates:
+        raise LookupError(f"None of the target names were found: {', '.join(TARGET_NAMES)}")
+
+    _, node = max(candidates, key=lambda item: item[0])
+    element = node.parent
+    status_pattern = re.compile(
+        r"ACCURACY_GATE_FAILED|INFRA_ERROR|PULL_ERROR|OUTPUT_MALFORMED|"
+        r"OUTPUT_MISSING|INVALID_RESULTS_SCHEMA|TIMEOUT|RUNTIME_ERROR"
+    )
+
+    # Walk upward until the complete card/row is captured. Stop at a reasonably
+    # small container to avoid borrowing values from neighbouring submissions.
+    best = element
+    for _ in range(8):
+        if element is None:
             break
+        blob = _all_element_text(element)
+        if status_pattern.search(blob) or re.search(r"\btokens?\b.*\baccuracy\b", blob, re.I):
+            best = element
+            # Timestamp tooltips are often one or two wrappers higher.
+            if re.search(r"submitted|resubmitted|scored|checked", blob, re.I):
+                break
+        if len(blob) > 2500:
+            break
+        element = element.parent
+    return best
 
-    if match_index is None or matched_line is None:
-        raise LookupError(
-            f"None of the target names were found: {', '.join(TARGET_NAMES)}"
-        )
+
+def _extract_timestamp(blob: str, labels: tuple[str, ...]) -> str | None:
+    # Examples currently used by the site include:
+    # "last resubmitted Jul 11, 22:52 GMT+8" and "checked Jul 11, 22:34 GMT+8".
+    label_group = "|".join(re.escape(x) for x in labels)
+    patterns = (
+        rf"(?:{label_group})\s*[:\-]?\s*([A-Z][a-z]{{2}}\s+\d{{1,2}},?\s+\d{{1,2}}:\d{{2}}(?:\s*[AP]M)?(?:\s*GMT[+-]\d{{1,2}})?)",
+        rf"(?:{label_group})\s*[:\-]?\s*(\d{{4}}-\d{{2}}-\d{{2}}[T ]\d{{2}}:\d{{2}}(?::\d{{2}})?(?:\.\d+)?(?:Z|[+-]\d{{2}}:\d{{2}})?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, blob, re.I)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+    return None
+
+
+def parse_snapshot(html: str) -> LeaderboardSnapshot:
+    soup = BeautifulSoup(html, "html.parser")
+    container = _find_target_container(soup)
+    blob = _all_element_text(container)
 
     status_values = (
         "ACCURACY_GATE_FAILED",
@@ -148,63 +204,63 @@ def parse_snapshot(html: str) -> LeaderboardSnapshot:
         "TIMEOUT",
         "RUNTIME_ERROR",
     )
+    status = next((value for value in status_values if re.search(rf"\b{re.escape(value)}\b", blob)), None)
 
-    # The failure status is rendered on the same line as the submission name.
-    # Only read status from that exact line so values belonging to nearby entries
-    # cannot leak into this submission.
-    status = next((value for value in status_values if value in matched_line), None)
-
-    # Remove the status suffix from the displayed submission title.
-    submission = matched_line
-    if status:
-        submission = re.sub(rf"\s*{re.escape(status)}\s*$", "", submission).strip()
+    # Use the longest configured alias present as the displayed target name.
+    submission = next(
+        (alias for alias in sorted(TARGET_NAMES, key=len, reverse=True) if alias.casefold() in blob.casefold()),
+        TARGET_NAMES[0],
+    )
 
     rank = None
     tokens = None
     accuracy = None
     team = None
 
+    rank_match = re.search(r"(?:^|\s)(?:0)?(\d{1,4})(?:\s|\.)", blob)
+    token_match = re.search(r"([\d,]+)\s+tokens?", blob, re.I)
+    accuracy_match = re.search(r"(\d+(?:\.\d+)?)%\s*(?:accuracy)?", blob, re.I)
+
     if status is None:
-        # Ranked rows have rank before the title and team/metrics immediately after it.
-        for line in reversed(lines[max(0, match_index - 6) : match_index]):
-            m = re.fullmatch(r"0?(\d{1,4})", line)
-            if m:
-                rank = int(m.group(1))
-                break
+        if rank_match:
+            rank = int(rank_match.group(1))
+        if token_match:
+            tokens = int(token_match.group(1).replace(",", ""))
+        if accuracy_match:
+            accuracy = float(accuracy_match.group(1))
+    elif status == "ACCURACY_GATE_FAILED" and accuracy_match:
+        accuracy = float(accuracy_match.group(1))
 
-        after = lines[match_index + 1 : match_index + 5]
-        if after:
-            possible_team = after[0]
-            if not re.search(r"tokens?|accuracy|%|ERROR|FAILED|TIMEOUT", possible_team, re.I):
-                team = possible_team
-        for line in after:
-            m = re.search(r"([\d,]+)\s+tokens?", line, re.I)
-            if m:
-                tokens = int(m.group(1).replace(",", ""))
-            m = re.search(r"(\d+(?:\.\d+)?)%\s+accuracy", line, re.I)
-            if m:
-                accuracy = float(m.group(1))
-    elif status == "ACCURACY_GATE_FAILED":
-        # Only this status has a percentage, and it appears directly below its row.
-        for line in lines[match_index + 1 : match_index + 5]:
-            m = re.fullmatch(r"(\d+(?:\.\d+)?)%", line)
-            if m:
-                accuracy = float(m.group(1))
-                break
+    last_submitted = _extract_timestamp(
+        blob,
+        ("last resubmitted", "last submitted", "submitted"),
+    )
+    last_scored = _extract_timestamp(
+        blob,
+        ("last scored", "scored", "checked"),
+    )
 
-    # Keep only stable row data in the fingerprint. Nearby timestamps and page text
-    # can change without the submission itself changing.
-    context = matched_line
+    # Fallback: the timestamp wrapper may sit just outside the card chosen above.
+    if (last_submitted is None or last_scored is None) and container.parent is not None:
+        parent_blob = _all_element_text(container.parent)
+        last_submitted = last_submitted or _extract_timestamp(
+            parent_blob, ("last resubmitted", "last submitted", "submitted")
+        )
+        last_scored = last_scored or _extract_timestamp(
+            parent_blob, ("last scored", "scored", "checked")
+        )
 
     return LeaderboardSnapshot(
-        target=submission or TARGET_NAMES[0],
+        target=submission,
         rank=rank,
         submission=submission,
         team=team,
         tokens=tokens,
         accuracy=accuracy,
         status=status,
-        context=context,
+        last_scored=last_scored,
+        last_submitted=last_submitted,
+        context=blob[:1200],
     )
 
 
@@ -222,8 +278,11 @@ def describe(snapshot: LeaderboardSnapshot) -> str:
         fields.append(f"Tokens: <b>{snapshot.tokens:,}</b>")
     if snapshot.accuracy is not None:
         fields.append(f"Accuracy: <b>{snapshot.accuracy:.1f}%</b>")
-    if snapshot.status:
-        fields.append(f"Status: <b>{snapshot.status}</b>")
+    fields.append(f"Status: <b>{snapshot.status or 'No status shown'}</b>")
+    if snapshot.last_scored:
+        fields.append(f"Last scored: <b>{snapshot.last_scored}</b>")
+    if snapshot.last_submitted:
+        fields.append(f"Last submitted: <b>{snapshot.last_submitted}</b>")
     fields.append(f'<a href="{LEADERBOARD_URL}">Open leaderboard</a>')
     return "\n".join(fields)
 
@@ -248,6 +307,8 @@ def describe_changes(previous: LeaderboardSnapshot, current: LeaderboardSnapshot
         "status": "Status",
         "submission": "Submission",
         "team": "Team",
+        "last_scored": "Last scored",
+        "last_submitted": "Last submitted",
     }
     changes = []
     for field, label in labels.items():
