@@ -109,66 +109,78 @@ def parse_snapshot(html: str) -> LeaderboardSnapshot:
     lowered_aliases = [alias.casefold() for alias in TARGET_NAMES]
 
     match_index = None
-    matched_target = None
+    matched_line = None
     for i, line in enumerate(lines):
         folded = line.casefold()
         if any(alias in folded for alias in lowered_aliases):
             match_index = i
-            matched_target = line
+            matched_line = line
             break
 
-    if match_index is None:
+    if match_index is None or matched_line is None:
         raise LookupError(
             f"None of the target names were found: {', '.join(TARGET_NAMES)}"
         )
 
-    window = lines[max(0, match_index - 8) : min(len(lines), match_index + 12)]
-    context = " | ".join(window)
-
-    rank = None
-    for line in reversed(lines[max(0, match_index - 8) : match_index]):
-        m = re.fullmatch(r"0?(\d{1,4})", line)
-        if m:
-            rank = int(m.group(1))
-            break
-
-    tokens = None
-    accuracy = None
-    status = None
     status_values = (
         "ACCURACY_GATE_FAILED",
         "INFRA_ERROR",
         "PULL_ERROR",
         "OUTPUT_MALFORMED",
         "OUTPUT_MISSING",
+        "INVALID_RESULTS_SCHEMA",
         "TIMEOUT",
         "RUNTIME_ERROR",
     )
 
-    for line in window:
-        if tokens is None:
+    # The failure status is rendered on the same line as the submission name.
+    # Only read status from that exact line so values belonging to nearby entries
+    # cannot leak into this submission.
+    status = next((value for value in status_values if value in matched_line), None)
+
+    # Remove the status suffix from the displayed submission title.
+    submission = matched_line
+    if status:
+        submission = re.sub(rf"\s*{re.escape(status)}\s*$", "", submission).strip()
+
+    rank = None
+    tokens = None
+    accuracy = None
+    team = None
+
+    if status is None:
+        # Ranked rows have rank before the title and team/metrics immediately after it.
+        for line in reversed(lines[max(0, match_index - 6) : match_index]):
+            m = re.fullmatch(r"0?(\d{1,4})", line)
+            if m:
+                rank = int(m.group(1))
+                break
+
+        after = lines[match_index + 1 : match_index + 5]
+        if after:
+            possible_team = after[0]
+            if not re.search(r"tokens?|accuracy|%|ERROR|FAILED|TIMEOUT", possible_team, re.I):
+                team = possible_team
+        for line in after:
             m = re.search(r"([\d,]+)\s+tokens?", line, re.I)
             if m:
                 tokens = int(m.group(1).replace(",", ""))
-        if accuracy is None:
             m = re.search(r"(\d+(?:\.\d+)?)%\s+accuracy", line, re.I)
-            if not m:
-                m = re.fullmatch(r"(\d+(?:\.\d+)?)%", line)
             if m:
                 accuracy = float(m.group(1))
-        if status is None:
-            status = next((value for value in status_values if value in line), None)
+    elif status == "ACCURACY_GATE_FAILED":
+        # Only this status has a percentage, and it appears directly below its row.
+        for line in lines[match_index + 1 : match_index + 5]:
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)%", line)
+            if m:
+                accuracy = float(m.group(1))
+                break
 
-    # On ranked entries, the line after the submission is commonly the team name.
-    submission = matched_target
-    team = None
-    if match_index + 1 < len(lines):
-        possible_team = lines[match_index + 1]
-        if not re.search(r"tokens?|accuracy|%|ERROR|FAILED|TIMEOUT", possible_team, re.I):
-            team = possible_team
+    context_lines = lines[max(0, match_index - 2) : match_index + 5]
+    context = " | ".join(context_lines)
 
     return LeaderboardSnapshot(
-        target=matched_target or TARGET_NAMES[0],
+        target=submission or TARGET_NAMES[0],
         rank=rank,
         submission=submission,
         team=team,
