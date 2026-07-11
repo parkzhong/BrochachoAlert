@@ -20,9 +20,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TRACK_NUMBER = os.getenv("TRACK_NUMBER", "1").strip()
+TRACK_TITLES = {
+    "1": "General-Purpose AI Agent",
+    "2": "Video Captioning",
+    "3": "Unicorn (Open Innovation)",
+}
+TRACK_TITLE = os.getenv("TRACK_TITLE", TRACK_TITLES.get(TRACK_NUMBER, "Unknown Track"))
 LEADERBOARD_URL = os.getenv(
     "LEADERBOARD_URL",
-    "https://lablab.ai/ai-hackathons/amd-developer-hackathon-act-ii/live?track=2",
+    f"https://lablab.ai/ai-hackathons/amd-developer-hackathon-act-ii/live?track={TRACK_NUMBER}",
 )
 TARGET_NAMES = [
     name.strip()
@@ -196,7 +203,10 @@ def get_snapshot() -> LeaderboardSnapshot:
 
 
 def describe(snapshot: LeaderboardSnapshot) -> str:
-    fields = [f"<b>{snapshot.target}</b>"]
+    fields = [
+        f"<b>{snapshot.target}</b>",
+        f"Track: <b>{TRACK_NUMBER} — {TRACK_TITLE}</b>",
+    ]
     fields.append(f"Rank: <b>#{snapshot.rank}</b>" if snapshot.rank else "Rank: not currently ranked")
     if snapshot.tokens is not None:
         fields.append(f"Tokens: <b>{snapshot.tokens:,}</b>")
@@ -208,6 +218,38 @@ def describe(snapshot: LeaderboardSnapshot) -> str:
     return "\n".join(fields)
 
 
+def _display_value(field: str, value) -> str:
+    if value is None:
+        return "—"
+    if field == "rank":
+        return f"#{value}"
+    if field == "tokens":
+        return f"{value:,}"
+    if field == "accuracy":
+        return f"{value:.1f}%"
+    return str(value)
+
+
+def describe_changes(previous: LeaderboardSnapshot, current: LeaderboardSnapshot) -> str:
+    labels = {
+        "rank": "Rank",
+        "tokens": "Tokens",
+        "accuracy": "Accuracy",
+        "status": "Status",
+        "submission": "Submission",
+        "team": "Team",
+    }
+    changes = []
+    for field, label in labels.items():
+        old = getattr(previous, field)
+        new = getattr(current, field)
+        if old != new:
+            changes.append(
+                f"• <b>{label}:</b> {_display_value(field, old)} → {_display_value(field, new)}"
+            )
+    return "\n".join(changes) if changes else "• Leaderboard entry changed"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
         return
@@ -215,7 +257,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_ids.add(update.effective_chat.id)
     save_subscribers(chat_ids)
     await update.message.reply_text(
-        "✅ Subscribed. I’ll notify this chat whenever the Brochacos leaderboard entry changes.\n\n"
+        f"✅ Subscribed to Brochacos updates for Track {TRACK_NUMBER} — {TRACK_TITLE}.\n\n"
         "Commands:\n/status — check now\n/stop — unsubscribe"
     )
 
@@ -245,6 +287,12 @@ async def check_leaderboard(context: ContextTypes.DEFAULT_TYPE) -> None:
         current = await asyncio.to_thread(get_snapshot)
         previous_data = load_json(STATE_FILE, None)
         previous_fingerprint = previous_data.get("fingerprint") if previous_data else None
+        previous_snapshot = None
+        if previous_data and previous_data.get("snapshot"):
+            try:
+                previous_snapshot = LeaderboardSnapshot(**previous_data["snapshot"])
+            except TypeError:
+                logger.warning("Ignoring incompatible saved snapshot")
 
         save_json(
             STATE_FILE,
@@ -255,7 +303,17 @@ async def check_leaderboard(context: ContextTypes.DEFAULT_TYPE) -> None:
         if previous_fingerprint is None or previous_fingerprint == current.fingerprint:
             return
 
-        message = "🚨 <b>Brochacos leaderboard updated</b>\n\n" + describe(current)
+        changes = (
+            describe_changes(previous_snapshot, current)
+            if previous_snapshot is not None
+            else "• Leaderboard entry changed"
+        )
+        message = (
+            f"🚨 <b>Brochacos update — Track {TRACK_NUMBER}</b>\n"
+            f"<b>{TRACK_TITLE}</b>\n\n"
+            f"<b>Changes</b>\n{changes}\n\n"
+            + describe(current)
+        )
         for chat_id in subscribers():
             try:
                 await context.bot.send_message(
