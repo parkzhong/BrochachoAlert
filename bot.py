@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -36,7 +37,8 @@ TARGET_NAMES = [
     for name in os.getenv("TARGET_NAMES", "Brocacho caption,Brochacos,Brocacho").split(",")
     if name.strip()
 ]
-CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "300")))
+CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
+FIXED_CHAT_IDS = {int(x.strip()) for x in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()}
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
@@ -80,7 +82,9 @@ def save_json(path: Path, value) -> None:
 
 
 def subscribers() -> set[int]:
-    return {int(chat_id) for chat_id in load_json(SUBSCRIBERS_FILE, [])}
+    # Railway redeploys can erase local files. TELEGRAM_CHAT_IDS provides a persistent fallback.
+    saved = {int(chat_id) for chat_id in load_json(SUBSCRIBERS_FILE, [])}
+    return saved | FIXED_CHAT_IDS
 
 
 def save_subscribers(chat_ids: Iterable[int]) -> None:
@@ -88,8 +92,11 @@ def save_subscribers(chat_ids: Iterable[int]) -> None:
 
 
 def fetch_page() -> str:
+    # Add a cache-busting query parameter so the CDN does not return an old leaderboard snapshot.
+    separator = "&" if "?" in LEADERBOARD_URL else "?"
+    fresh_url = f"{LEADERBOARD_URL}{separator}_={int(time.time())}"
     response = requests.get(
-        LEADERBOARD_URL,
+        fresh_url,
         timeout=30,
         headers={
             "User-Agent": (
@@ -97,6 +104,8 @@ def fetch_page() -> str:
                 "+https://telegram.org/)"
             ),
             "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
         },
     )
     response.raise_for_status()
@@ -183,8 +192,9 @@ def parse_snapshot(html: str) -> LeaderboardSnapshot:
                 accuracy = float(m.group(1))
                 break
 
-    context_lines = lines[max(0, match_index - 2) : match_index + 5]
-    context = " | ".join(context_lines)
+    # Keep only stable row data in the fingerprint. Nearby timestamps and page text
+    # can change without the submission itself changing.
+    context = matched_line
 
     return LeaderboardSnapshot(
         target=submission or TARGET_NAMES[0],
@@ -257,8 +267,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_ids.add(update.effective_chat.id)
     save_subscribers(chat_ids)
     await update.message.reply_text(
-        f"✅ Subscribed to Brochacos updates for Track {TRACK_NUMBER} — {TRACK_TITLE}.\n\n"
-        "Commands:\n/status — check now\n/stop — unsubscribe"
+        f"✅ Subscribed to Brochacos updates for Track {TRACK_NUMBER} — {TRACK_TITLE}.\n"
+        f"Chat ID: <code>{update.effective_chat.id}</code>\n\n"
+        "For reliable alerts after Railway redeploys, save this ID in the Railway variable "
+        "<code>TELEGRAM_CHAT_IDS</code>.\n\n"
+        "Commands:\n/status — check now\n/stop — unsubscribe",
+        parse_mode=ParseMode.HTML
     )
 
 
